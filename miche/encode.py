@@ -39,16 +39,60 @@ def reconstruction(args, model, bounds=(-1.25, -1.25, -1.25, 1.25, 1.25, 1.25), 
     
     return 0
 
-def load_model(ckpt_path="miche/shapevae-256.ckpt", config_path="miche/shapevae-256.yaml"):
+
+import os
+# 【关键修复】：强制使用国内镜像站！必须写在最前面！
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+import torch
+from omegaconf import OmegaConf
+from huggingface_hub import hf_hub_download
+
+def get_huggingface_weight(repo_id="Maikou/Michelangelo", filename="checkpoints/aligned_shape_latents/shapevae-256.ckpt"):
+    """
+    自动从 Hugging Face 下载权重并返回本地缓存路径。
+    如果本地已有缓存，则瞬间返回路径，不会重复下载。
+    """
+    print(f"正在从 Hugging Face 获取: {filename} ...")
+    try:
+        # 这个函数会返回文件在本地的绝对路径 (通常在 ~/.cache/huggingface/hub/ 下)
+        local_ckpt_path = hf_hub_download(
+            repo_id=repo_id, 
+            filename=filename,
+            # 如果服务器在国内，可能需要配置代理或者使用国内镜像
+            # endpoint="https://hf-mirror.com"  # 取消注释这行可以使用国内镜像加速下载
+        )
+        print(f"✅ 下载/读取成功！本地路径: {local_ckpt_path}")
+        return local_ckpt_path
+    except Exception as e:
+        print(f"❌ 下载失败: {e}")
+        return None
+
+def load_model(config_path="miche/shapevae-256.yaml"):
+    # 1. 自动下载完整的官方权重
+    ckpt_path = get_huggingface_weight(
+        repo_id="Maikou/Michelangelo", 
+        filename="checkpoints/aligned_shape_latents/shapevae-256.ckpt" # 换成目标文件名
+    )
+    
+    if ckpt_path is None:
+        raise RuntimeError("无法获取模型权重，请检查网络！")
+
+    # 2. 读取网络配置
     model_config = OmegaConf.load(config_path)
-    # print(model_config)
     if hasattr(model_config, "model"):
         model_config = model_config.model
 
-    model = instantiate_from_config(model_config, ckpt_path=ckpt_path)
+    # 3. 实例化空模型
+    # 注意：为了让模型自动处理内部模块，这里我们直接把 ckpt_path 传进去
+    # 因为你下载的是官方完整版权重，所以不需要像裁剪版那样加 strict=False 了
+    print("正在将权重加载到模型中...")
+    model = instantiate_from_config(model_config, ckpt_path=ckpt_path) 
+    
     model = model.eval()
-
+    print("✅ Michelangelo 完整模型加载完毕！")
+    
     return model
+
 if __name__ == "__main__":
     '''
     1. Reconstruct point cloud

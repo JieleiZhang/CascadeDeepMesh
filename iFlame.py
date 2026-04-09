@@ -74,8 +74,8 @@ class Args:
         self.layer_decay = 0.75   # Layer-wise learning rate decay
         self.min_lr = 1.28e-6        # Minimum learning rate
         self.warmup_epochs =10    # Number of warmup epochs
-        self.epochs =200      # Total number of training epochs
-        self.batch_size = 20  #40#57   # Batch size
+        self.epochs =400      # Total number of training epochs
+        self.batch_size = 16  #40#57   # Batch size
         # self.world_size = 4       # Number of dist5ributed processes (adjust if using DDP)
 
 args = Args()
@@ -136,7 +136,7 @@ def inverse_discretize(vertices_quantized, num_tokens=256):
 
 def train_model(model, scheduler, optimizer, criterion, dataloader, device, scaler, epochs=200, rank=0, data_iter_step=0, startepoc=0, dataloader1=None):
     model.train()
-    best_val_loss = float('inf') # 🌟 现在我们追踪最佳的验证集 Loss
+    best_val_loss = float('inf') 
     
     if rank == 0:
         wandb.init(
@@ -152,6 +152,7 @@ def train_model(model, scheduler, optimizer, criterion, dataloader, device, scal
 
         torch.cuda.empty_cache()
         total_loss = 0
+        total_train_acc = 0.0 # 🌟 新增：用于累加训练集 epoch 的总准确率
         dataloader.sampler.set_epoch(epoch)
         
         # ==========================================================
@@ -174,7 +175,6 @@ def train_model(model, scheduler, optimizer, criterion, dataloader, device, scal
                     logits = outputs.contiguous().view(-1, vocab_size)  
                     loss = criterion(logits, targets)
                     
-                    # 提前列出所有在条件分支中可能被闲置的层/参数
                     suspicious_keywords = ['null_context', 'cond_proj', 'cond_head_proj']
                     
                     dummy_loss = 0.0
@@ -198,6 +198,8 @@ def train_model(model, scheduler, optimizer, criterion, dataloader, device, scal
                 scaler.scale(loss).backward()
                 
                 acc = accuracy_(logits.detach(), targets, ignore_label=-100, device=device)
+                total_train_acc += acc.item() # 🌟 新增：累加 Batch Accuracy
+                
                 pbar.set_postfix({'loss': loss_value, 'acc': acc.item()})
                             
                 if (batch_idx + 1) % accumulation_steps == 0:
@@ -210,20 +212,23 @@ def train_model(model, scheduler, optimizer, criterion, dataloader, device, scal
                     optimizer.zero_grad()
 
                     if rank == 0 and iter_idx % 10 == 0:
-                        wandb.log({"iter_train_loss": loss_value, "lr": optimizer.param_groups[0]['lr']})
+                        wandb.log({"iter_train_loss": loss_value, "iter_train_acc": acc.item(), "lr": optimizer.param_groups[0]['lr']})
 
         avg_train_loss = total_loss / len(dataloader)
+        avg_train_acc = total_train_acc / len(dataloader) # 🌟 新增：计算 Epoch 平均训练准确率
 
         # ==========================================================
-        # 🧪 阶段 2：验证阶段 (Validation) - 新增！
+        # 🧪 阶段 2：验证阶段 (Validation)
         # ==========================================================
-        avg_val_loss = float('inf') # 默认值
+        avg_val_loss = float('inf') 
+        avg_val_acc = 0.0 # 🌟 新增：验证集平均准确率默认值
         
         if dataloader1 is not None:
-            model.eval() # ⚠️ 极其重要：切换到评估模式 (关闭 Dropout 等)
+            model.eval() 
             val_total_loss = 0
+            val_total_acc = 0.0 # 🌟 新增：用于累加验证集 epoch 的总准确率
             
-            with torch.no_grad(): # ⚠️ 极其重要：关闭梯度计算，节省显存，加速推理
+            with torch.no_grad(): 
                 with tqdm(dataloader1, desc=f"Epoch {epoch}/{epochs} [Val]", disable=(rank != 0)) as val_pbar:
                     for val_batch in val_pbar:
                         val_input_ids = val_batch['input_ids'].to(device)
@@ -238,36 +243,44 @@ def train_model(model, scheduler, optimizer, criterion, dataloader, device, scal
                             val_logits = val_outputs.contiguous().view(-1, val_outputs.size(-1))  
                             v_loss = criterion(val_logits, val_targets)
                             
+                        # 🌟 新增：计算验证集的 Accuracy
+                        v_acc = accuracy_(val_logits.detach(), val_targets, ignore_label=-100, device=device)
+                        
                         val_total_loss += v_loss.item()
-                        val_pbar.set_postfix({'val_loss': v_loss.item()})
+                        val_total_acc += v_acc.item() # 🌟 新增：累加验证集 Accuracy
+                        
+                        val_pbar.set_postfix({'val_loss': v_loss.item(), 'val_acc': v_acc.item()})
                         
             avg_val_loss = val_total_loss / len(dataloader1)
-            model.train() # ⚠️ 验证结束：必须切回训练模式！
-            # ==========================================
-            # 🧹 新增：彻底清理验证集残留的显存碎片
-            # ==========================================
+            avg_val_acc = val_total_acc / len(dataloader1) # 🌟 新增：计算 Epoch 平均验证准确率
+            
+            model.train() 
             try:
-                del val_input_ids, val_labels, val_sampled_points, val_inputs, val_targets, val_outputs, val_logits, v_loss
+                del val_input_ids, val_labels, val_sampled_points, val_inputs, val_targets, val_outputs, val_logits, v_loss, v_acc
             except NameError:
                 pass
             torch.cuda.empty_cache()
 
         # ==========================================================
-        # 💾 阶段 3：日志打印与模型保存 (改用 Val Loss 判定)
+        # 💾 阶段 3：日志打印与模型保存
         # ==========================================================
         if rank == 0:
-            print(f"✅ Epoch {epoch} 完成 | Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f}")
+            # 🌟 新增：在终端打印出 Train Acc 和 Val Acc
+            print(f"✅ Epoch {epoch} 完成 | Train Loss: {avg_train_loss:.4f} | Train Acc: {avg_train_acc:.4f} | Val Loss: {avg_val_loss:.4f} | Val Acc: {avg_val_acc:.4f}")
             
-            # 记录到 Wandb
-            wandb_log_dict = {"epoch": epoch, "epoch_train_loss": avg_train_loss}
+            # 🌟 新增：将 Accuracy 记录到 Wandb
+            wandb_log_dict = {
+                "epoch": epoch, 
+                "epoch_train_loss": avg_train_loss,
+                "epoch_train_acc": avg_train_acc
+            }
             if dataloader1 is not None:
                 wandb_log_dict["epoch_val_loss"] = avg_val_loss
+                wandb_log_dict["epoch_val_acc"] = avg_val_acc
             wandb.log(wandb_log_dict)
 
-            # 决定追踪的 Metric
             metric_to_track = avg_val_loss if dataloader1 is not None else avg_train_loss
             
-            # 🌟 修复：把 checkpoint 的组装提出来，确保每次 epoch 都有这个变量
             os.makedirs('checkpoints', exist_ok=True)
             current_checkpoint = {
                 'epoch': epoch,
@@ -278,18 +291,16 @@ def train_model(model, scheduler, optimizer, criterion, dataloader, device, scal
                 'data_iter_step': data_iter_step
             }
             
-            # 1. 保存 Best 模型
             if metric_to_track < best_val_loss:
                 best_val_loss = metric_to_track
-                best_path = "checkpoints/iFlame_best_3.pth"
+                best_path = "checkpoints/iFlame_best_400.pth"
                 torch.save(current_checkpoint, best_path)
                 print(f"⭐ 发现更低 Val Loss: {best_val_loss:.6f}, 已更新 best 权重。")
             
-            # 2. 定期备份（比如每 10 个 Epoch 存一次，方便你观察中间态，建议从 50 改为 10 或 20）
-            # if epoch % 10 == 0:
-            #     epoch_path = f"/webdav/Storage(default)/MyData/Code/iFlame/checkpoints/iFlame_400_epoch_{epoch}_.pth"
-            #     torch.save(current_checkpoint, epoch_path)
-            #     print(f"💾 已备份 Epoch {epoch} 权重。")
+            if epoch % 10 == 0:
+                epoch_path = f"checkpoints/iFlame_400_epoch_{epoch}_.pth"
+                torch.save(current_checkpoint, epoch_path)
+                print(f"💾 已备份 Epoch {epoch} 权重。")
 
 
 def main(rank, world_size):
@@ -320,16 +331,16 @@ def main(rank, world_size):
         print("🛡️ 开启两阶段训练法：阶段一（精准冻结老教授，狂练新生儿！）")
 
     # 默认全开启
-    for param in model.parameters():
-        param.requires_grad = True
+    # for param in model.parameters():
+    #     param.requires_grad = True
 
-    # 针对性冻结
-    for name, param in model.named_parameters():
-        # 注意：在DDP包装前，name不带'module.'前缀
-        if 'pc_adapter.encoder' in name: 
-            param.requires_grad = False
-        if 'pc_adapter.cond_head_proj' in name or 'pc_adapter.cond_proj' in name:
-            param.requires_grad = True
+    # # 针对性冻结
+    # for name, param in model.named_parameters():
+    #     # 注意：在DDP包装前，name不带'module.'前缀
+    #     if 'pc_adapter.encoder' in name: 
+    #         param.requires_grad = False
+    #     if 'pc_adapter.cond_head_proj' in name or 'pc_adapter.cond_proj' in name:
+    #         param.requires_grad = True
 
     # 4. 加载预训练权重 (在 DDP 包装前加载，逻辑更清晰)
     checkpoint_path = None # "checkpoints/iFlame_best.pth"

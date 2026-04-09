@@ -19,6 +19,92 @@ from einops import rearrange, repeat, pack
 from miche.michelangelo.models.tsal.sal_perceiver import AlignedShapeLatentPerceiver
 
 
+from beartype import beartype
+from miche.encode import load_model
+# helper functions
+
+def exists(val):
+    return val is not None
+
+def default(*values):
+    for value in values:
+        if exists(value):
+            return value
+    return None
+
+
+# point-cloud encoder from Michelangelo
+@beartype
+class PointConditioner(torch.nn.Module):
+    def __init__(
+        self,
+        *,
+        dim_latent = None,
+        model_name = 'miche-256-feature',
+        cond_dim = 768,
+        out_dim = 256,   # 👈 新增参数：目标输出维度 (对齐 iFlame)
+        freeze = True,
+    ):
+        super().__init__()
+
+        # open-source version of miche
+        if model_name == 'miche-256-feature':
+            ckpt_path = "./checkpoints/michelangelo_encoder_only.pth"
+            config_path = 'miche/shapevae-256.yaml'
+
+            self.feature_dim = out_dim    # embedding dimension
+            self.cond_length = 257     # length of embedding
+            self.point_encoder = load_model(config_path=config_path)
+            
+            # additional layers to connect miche and GPT
+            self.cond_head_proj = nn.Linear(cond_dim, self.feature_dim)
+            self.cond_proj = nn.Linear(cond_dim, self.feature_dim)
+            
+        else:
+            raise NotImplementedError
+
+        # whether to finetuen point-cloud encoder
+        if freeze:
+            for parameter in self.point_encoder.parameters():
+                parameter.requires_grad = False
+
+        self.freeze = freeze
+        self.model_name = model_name
+        self.dim_latent = default(dim_latent, self.feature_dim)
+        
+        self.register_buffer('_device_param', torch.tensor(0.), persistent = False)
+
+
+    @property
+    def device(self):
+        return next(self.buffers()).device
+
+
+    def embed_pc(self, pc_normal):
+        # encode point cloud to embeddings
+        if self.model_name == 'miche-256-feature':
+            point_feature = self.point_encoder.encode_latents(pc_normal)
+            pc_embed_head = self.cond_head_proj(point_feature[:, 0:1])
+            pc_embed = self.cond_proj(point_feature[:, 1:])
+            pc_embed = torch.cat([pc_embed_head, pc_embed], dim=1)
+
+        return pc_embed
+
+
+    def forward(
+        self,
+        pc = None,
+        pc_embeds = None,
+    ):
+        if pc_embeds is None:
+            pc_embeds = self.embed_pc(pc.to(next(self.buffers()).dtype))
+            
+        assert not torch.any(torch.isnan(pc_embeds)), 'NAN values in pc embedings'
+        
+        return pc_embeds
+    
+
+
 class MichelangeloAdapter(nn.Module):
     def __init__(self, weights_path, iflame_dim=256, freeze=True):
         super().__init__()
@@ -214,6 +300,7 @@ class DifferentialTransformerBlockrope(nn.Module):
         self.feed_forward = SwiGLU(embed_dim)
         self.norm1 = RMSNorm(embed_dim, eps=1e-5)
         self.norm2 = RMSNorm(embed_dim, eps=1e-5)
+        self.norm_context = RMSNorm(embed_dim, eps=1e-5)
     
     def forward(self, x, context=None, use_cache=False,return_attn=False):
         """
@@ -228,7 +315,7 @@ class DifferentialTransformerBlockrope(nn.Module):
         if context is None:
             attn_out = self.attn(self.norm1(x), causal=self.causal,return_attn=return_attn)
         else:
-            attn_out = self.attn(self.norm1(x), context=self.norm2(context), causal=self.causal,return_attn=return_attn)
+            attn_out = self.attn(self.norm1(x), context=self.norm_context(context), causal=self.causal,return_attn=return_attn)
 
         x = x + attn_out
 
@@ -433,9 +520,15 @@ class iFlame(nn.Module):
         self.norm = RMSNorm(embed_dim, eps=1e-5)
 
         # 接入 Michelangelo
-        self.pc_adapter = MichelangeloAdapter(
-            weights_path="./checkpoints/michelangelo_encoder_only.pth",
-            iflame_dim=embed_dim,
+        # self.pc_adapter = MichelangeloAdapter(
+        #     weights_path="./checkpoints/michelangelo_encoder_only.pth",
+        #     iflame_dim=embed_dim,
+        #     freeze=True
+        # )
+        self.pc_adapter = PointConditioner(
+            model_name='miche-256-feature',
+            cond_dim=768,           # Miche 原始特征维度
+            out_dim=embed_dim,      # 映射到你的 iFlame 维度
             freeze=True
         )
 
@@ -461,8 +554,8 @@ class iFlame(nn.Module):
             context = self.pc_adapter(pc) # 正常提取点云特征 [B, N, C]
             
             # 训练阶段：以 15% 的概率随机 Drop 掉条件，替换为 null_context
-            if self.training and torch.rand(1, device=x.device).item() < 0.15:
-                context = self.null_context.expand(batch_size, -1, -1)
+            # if self.training and torch.rand(1, device=x.device).item() < 0.15:
+            #     context = self.null_context.expand(batch_size, -1, -1)
         else:
             # 推理阶段：如果没有提供点云 (无条件生成)，直接使用 null_context
             context = self.null_context.expand(batch_size, -1, -1)
@@ -473,7 +566,7 @@ class iFlame(nn.Module):
         # Encoder 阶段
         for scale in range(self.depth):
             for block in self.encoder_blocks[scale]:
-                x = block(x)  # 这里仅进行 Self-Attention
+                x = block(x, context=context)
             
             encoder_outputs.append(x)
             x = self.downsamplers[scale](x)
@@ -493,8 +586,6 @@ class iFlame(nn.Module):
             x = shift_sequence(x, self.factor[scale] - 1)
             x = self.skip_weights2[scale] * x + skip
 
-            # 【优化 3】：在 Decoder 层也注入 context，加强模型对 3D 几何条件的感知对齐
-            # 注意：前提是你的 Decoder Block 内部支持 context 参数的解析
             for block in self.decoder_blocks[scale]:
                 x = block(x, context=context)  
 

@@ -56,7 +56,7 @@ class MultiheadFlashrope(nn.Module):
         self.kv_cache_enabled = False
         self.k_cache = None
         self.v_cache = None
-        self.cache_pos = 0  # Track position in cache
+        self.cache_pos = 0  
         
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=False)
         self.k_proj = nn.Linear(embed_dim, embed_dim, bias=False)
@@ -65,68 +65,78 @@ class MultiheadFlashrope(nn.Module):
         self.rotary = Rotary(self.head_dim)
 
     def forward(self, x, context=None, causal=False, return_attn=False):
-        """
-        Args:
-            x: [batch_size, tgt_len, embed_dim]
-            context: Optional context for cross-attention [batch_size, src_len, embed_dim]
-        """
         bsz, tgt_len, embed_dim = x.size()
         compute_attn_scores = return_attn and tgt_len == 1
+        
+        # 标志位：判断当前是 Self-Attention 还是 Cross-Attention
+        is_cross_attn = context is not None
 
         # Project inputs to q, k, v
         q = self.q_proj(x)
-        k = self.k_proj(context if context is not None else x)
-        v = self.v_proj(context if context is not None else x)
+        k = self.k_proj(context if is_cross_attn else x)
+        v = self.v_proj(context if is_cross_attn else x)
 
-        # Reshape to [batch_size, seq_len, num_heads, head_dim]
+        # Reshape: [batch_size, seq_len, num_heads, head_dim]
         q = q.view(bsz, -1, self.num_heads, self.head_dim)
         k = k.view(bsz, -1, self.num_heads, self.head_dim)
         v = v.view(bsz, -1, self.num_heads, self.head_dim)
 
-        # Handle KV cache if enabled
+        # ==========================================
+        # 核心逻辑 1：RoPE 处理 (保护点云)
+        # ==========================================
+        if not is_cross_attn:
+            # Self-Attention: Q 和 K 都要加 RoPE
+            if self.kv_cache_enabled:
+                q = self.rotary(q, offset=self.cache_pos)
+                k_new = self.rotary(k, offset=self.cache_pos)
+                k = k_new # KV cache 会用到 k_new
+            else:
+                q = self.rotary(q)
+                k = self.rotary(k)
+        else:
+            # Cross-Attention: 仅对查询序列 Q 加 RoPE，点云 K 保持静态结构！
+            q = self.rotary(q, offset=self.cache_pos if self.kv_cache_enabled else 0)
+            k_new = k  # 不做旋转
+
+        # ==========================================
+        # KV Cache 逻辑 (保持不变)
+        # ==========================================
         if self.kv_cache_enabled:
-            # Apply rotary embeddings with correct position offset for query
-            q = self.rotary(q, offset=self.cache_pos)
-            k_new = self.rotary(k, offset=self.cache_pos)
-            
-            # Update cache
             if self.k_cache is not None:
                 cache_len = k.size(1)
                 self.k_cache[:, self.cache_pos:self.cache_pos + cache_len] = k_new
                 self.v_cache[:, self.cache_pos:self.cache_pos + cache_len] = v
-                # Use entire cache for attention
+                
                 k = self.k_cache[:, :self.cache_pos + cache_len]
                 v = self.v_cache[:, :self.cache_pos + cache_len]
                 self.cache_pos += cache_len
+                
                 if compute_attn_scores:
-                    # [batch_size, num_heads, 1, cache_len]
                     attn_weights = torch.matmul(q.transpose(1, 2), k.transpose(1, 2).transpose(-2, -1))
                     attn_weights = attn_weights * self.scaling
                     self.attention_scores = F.softmax(attn_weights, dim=-1)
-        else:
-            # Normal operation without cache
-            q = self.rotary(q)
-            k = self.rotary(k)
 
-        # 【修改点 2】：针对 V100 替换掉 flash_attn_func，使用官方 SDPA
-        # 原维度: [batch_size, seq_len, num_heads, head_dim]
-        # SDPA 要求的维度: [batch_size, num_heads, seq_len, head_dim]
+        # ==========================================
+        # 核心逻辑 2：针对 V100 的 SDPA 与因果掩码屏蔽
+        # ==========================================
+        # 转置为 SDPA 要求的维度: [batch_size, num_heads, seq_len, head_dim]
         q_sdpa = q.transpose(1, 2)
         k_sdpa = k.transpose(1, 2)
         v_sdpa = v.transpose(1, 2)
 
-        # 调用 PyTorch 原生的 Scaled Dot-Product Attention (自动适配 V100 加速)
+        # 【重点】：如果是交叉注意力（看点云），强制关闭 Causal Mask！
+        final_causal = causal if not is_cross_attn else False
+
+        # 调用原生 SDPA
         attn_output = F.scaled_dot_product_attention(
             q_sdpa, 
             k_sdpa, 
             v_sdpa, 
-            is_causal=causal
+            is_causal=final_causal
         )
 
-        # 转回原维度结构: [batch_size, seq_len, num_heads, head_dim]
+        # 转回原维度并投影
         attn_output = attn_output.transpose(1, 2)
-
-        # Reshape output
         attn_output = attn_output.contiguous().view(bsz, tgt_len, embed_dim)
         attn_output = self.out_proj(attn_output)
 
