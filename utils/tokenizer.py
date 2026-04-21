@@ -218,7 +218,6 @@ class CascadedTokenizer:
 # --- 测试代码 ---
 # ====================== 【测试主函数：新增 删除token 测试】 ======================
 if __name__ == "__main__":
-    print("=== 开始运行 Tokenizer 回环测试 + 单Token删除测试 ===")
     
     tokenizer = CascadedTokenizer()
     
@@ -259,10 +258,6 @@ if __name__ == "__main__":
     print(f"[Stage2] {s2.shape}")
     print(f"[Stage3] {s3.shape}")
 
-    # =========================================================================
-    # ✅ 原版正常解码
-    # =========================================================================
-    print("\n===== [1/4] 原版无删除 解码 =====")
     mesh_recon, recon_tokens = tokenizer.decode_mesh(s1, s2, s3)
     if mesh_recon:
         mesh_recon.export("debug_orig.obj")

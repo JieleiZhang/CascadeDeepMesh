@@ -291,6 +291,7 @@ try:
 except ImportError:
     pass
 
+import random
 # -----------------------------------------------------------------------------
 # 带 Bound 控制的归一化函数
 # -----------------------------------------------------------------------------
@@ -340,20 +341,45 @@ def shift_vertices(vertices, x_lims=(-0.1, 0.1), y_lims=(-0.1, 0.1), z_lims=(-0.
     vertices = np.stack([vertices[:, 0] + x, vertices[:, 1] + y, vertices[:, 2] + z], axis=-1)
     return vertices
 
+def sample_pc(mesh, pc_num, total_pc_num=50000, with_normal=True, aug=True, overfit=False):
+    if overfit:
+        np.random.seed(42)
+        
+    if not with_normal:
+        points, _ = trimesh.sample.sample_surface(mesh, pc_num)
+        return points
+
+    # 1. 过采样 (Dense sampling)
+    points, face_idx = trimesh.sample.sample_surface(mesh, total_pc_num)
+    
+    # 2. 随机高斯抖动增强 (50% 概率触发)
+    if aug and random.random() < 0.5:
+        points += np.random.randn(*points.shape) * 0.01
+        
+    # 3. 获取法线并拼接
+    normals = mesh.face_normals[face_idx]
+    
+    # [保险起见] 确保法线单位化，防止出现极值或 NaN
+    normals = normals / (np.linalg.norm(normals, axis=1, keepdims=True) + 1e-8)
+    normals = np.nan_to_num(normals)
+    
+    pc_normal = np.concatenate([points, normals], axis=-1, dtype=np.float16)
+
+    # 4. 随机下采样到目标点数 (Random sample point cloud)
+    ind = np.random.choice(pc_normal.shape[0], pc_num, replace=False)
+    pc_normal = pc_normal[ind]
+    
+    return pc_normal
 # ==========================================
 # 🚀 更新后的 DataLoader
 # ==========================================
 class DynamicAugmentDataset(Dataset):
-    def __init__(self, input_pkl, split='train', maxlen=4608, num_pc_points=4096, scale_augment=True, shift_augment=False):
+    def __init__(self, input_pkl, split='train', maxlen=4608, num_pc_points=4096):
         self.split = split
         self.training = (split == 'train')
         self.maxlen = maxlen
         self.num_pc_points = num_pc_points
         self.tokenizer = CascadedTokenizer()
-        
-        # 新增增强控制参数
-        self.scale_augment = scale_augment
-        self.shift_augment = shift_augment
 
         print(f"⏳ 正在加载原始 PKL 数据集 [{split.upper()}] 到内存...")
         with open(input_pkl, 'rb') as f:
@@ -379,41 +405,39 @@ class DynamicAugmentDataset(Dataset):
                 v = self.vertices_list[idx].copy()
                 f = self.faces_list[idx]
                 
-                # =========================================================
-                # 2. 🔄 核心增强逻辑 (对齐 TrianglesDataset)
-                # =========================================================
-                # 无论是否训练，首先进行基准归一化
+                # 第一次归一化，把原始模型拉到标准大小
                 v = normalize_vertices(v)
-                
-                # 训练时且在容错尝试的前两轮内，应用数据增强
-                if self.training and iter_cnt <= 2:
-                    if self.scale_augment:
-                        v = scale_vertices(v)
-                    
-                    # 缩放后再次归一化，保证特征尺度一致
-                    v = normalize_vertices(v)
-                    
 
-                else:
-                    # 如果不是训练模式，或者由于严重错误退化到了 iter_cnt > 2，则仅保持归一化
-                    pass 
+                # =========================================================
+                # 🚀 整体 Mesh 空间增强逻辑 
+                # =========================================================
+                if self.training and iter_cnt <= 2:
+                    
+                    # 🚀 新增：X 轴独立随机缩放 (非等比例缩放)
+                    if self.scale_x_augment:
+                        scale_x = np.random.uniform(0.9, 1.1)
+                        
+                        v[:, 0] = v[:, 0] * scale_x
+                    
+                    v = normalize_vertices(v)
                 # =========================================================
 
-                # 3. ☁️ 点云采样与法线计算
+                # 2. ☁️ 点云采样与增强 (应用你的 sample_pc)
+                # 因为 v 已经被拉伸过了，这里实例化的 trimesh 会自动计算拉伸后的新法线，非常安全
                 mesh = trimesh.Trimesh(vertices=v, faces=f, process=False)
-                pc, face_indices = trimesh.sample.sample_surface(mesh, self.num_pc_points)
-                normals = mesh.face_normals[face_indices]
-                normals = normals / (np.linalg.norm(normals, axis=1, keepdims=True) + 1e-8)
-                normals = np.nan_to_num(normals)
                 
-                # 点云坐标抖动 (Jitter) - 保留原逻辑，防止点云过拟合
-                # if self.training:
-                #     jitter = np.random.normal(0, 0.002, size=pc.shape)
-                #     pc = pc + jitter
-                    
-                pc_with_normals = np.concatenate([pc, normals], axis=-1).astype(np.float32)
+                apply_aug = self.training and (iter_cnt <= 2)
+                
+                pc_with_normals = sample_pc(
+                    mesh=mesh, 
+                    pc_num=self.num_pc_points, 
+                    total_pc_num=16384, 
+                    with_normal=True, 
+                    aug=apply_aug,     
+                    overfit=False
+                )
 
-                # 4. 🧩 Tokenize 编码
+                # 3. 🧩 Tokenize 编码 (Tokenizer 会看到拉长/压扁后的模型)
                 raw_tokens = self.tokenizer.encode_mesh(mesh)
                 split_data = self.tokenizer.split_tokens(raw_tokens)
                 p_seq, b_seq, o_seq = split_data['stage1'], split_data['stage2'], split_data['stage3']
@@ -430,7 +454,7 @@ class DynamicAugmentDataset(Dataset):
                 if len(full_seq) > self.maxlen:
                     raise ValueError(f"Token长度 ({len(full_seq)}) 超出限制 ({self.maxlen})")
 
-                # 5. 填充 (Padding)
+                # 4. 填充 (Padding)
                 input_ids = full_seq.copy()
                 labels = input_ids.copy()
                 pad_len = self.maxlen - len(input_ids)
@@ -438,11 +462,9 @@ class DynamicAugmentDataset(Dataset):
                     input_ids = np.pad(input_ids, (0, pad_len), constant_values=self.tokenizer.PAD_TOKEN)
                     labels = np.pad(labels, (0, pad_len), constant_values=-100)
 
-                # ✅ 全部成功，跳出 while 循环，返回数据
                 break 
 
             except Exception as e:
-                # 容错重试
                 idx = np.random.randint(0, self.length)
 
         return {

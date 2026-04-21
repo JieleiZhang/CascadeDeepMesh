@@ -68,66 +68,87 @@ class MultiheadFlashrope(nn.Module):
         bsz, tgt_len, embed_dim = x.size()
         compute_attn_scores = return_attn and tgt_len == 1
         
-        # 标志位：判断当前是 Self-Attention 还是 Cross-Attention
         is_cross_attn = context is not None
 
-        # Project inputs to q, k, v
-        q = self.q_proj(x)
-        k = self.k_proj(context if is_cross_attn else x)
-        v = self.v_proj(context if is_cross_attn else x)
-
-        # Reshape: [batch_size, seq_len, num_heads, head_dim]
-        q = q.view(bsz, -1, self.num_heads, self.head_dim)
-        k = k.view(bsz, -1, self.num_heads, self.head_dim)
-        v = v.view(bsz, -1, self.num_heads, self.head_dim)
-
         # ==========================================
-        # 核心逻辑 1：RoPE 处理 (保护点云)
+        # 性能优化：Cross-Attention 推理加速
         # ==========================================
-        if not is_cross_attn:
-            # Self-Attention: Q 和 K 都要加 RoPE
-            if self.kv_cache_enabled:
-                q = self.rotary(q, offset=self.cache_pos)
-                k_new = self.rotary(k, offset=self.cache_pos)
-                k = k_new # KV cache 会用到 k_new
-            else:
-                q = self.rotary(q)
-                k = self.rotary(k)
+        # 如果是 Cross-Attention 且不是第一步 (已有缓存)，直接跳过点云的重复投影
+        if is_cross_attn and self.kv_cache_enabled and self.cache_pos > 0:
+            q = self.q_proj(x).view(bsz, -1, self.num_heads, self.head_dim)
+            q = self.rotary(q, offset=self.cache_pos)
+            
+            # 直接从静态缓存中取完整的点云 KV
+            k = self.k_cache[:, :self.context_len]
+            v = self.v_cache[:, :self.context_len]
+            
+            # Cross-Attention 的 cache_pos 仅用于跟踪 Q 的长度，以便正确进行 RoPE 偏移
+            self.cache_pos += tgt_len
+            
         else:
-            # Cross-Attention: 仅对查询序列 Q 加 RoPE，点云 K 保持静态结构！
-            q = self.rotary(q, offset=self.cache_pos if self.kv_cache_enabled else 0)
-            k_new = k  # 不做旋转
+            # === 常规计算流程 (训练阶段，或推理的第一步) ===
+            q = self.q_proj(x)
+            k = self.k_proj(context if is_cross_attn else x)
+            v = self.v_proj(context if is_cross_attn else x)
+
+            q = q.view(bsz, -1, self.num_heads, self.head_dim)
+            k = k.view(bsz, -1, self.num_heads, self.head_dim)
+            v = v.view(bsz, -1, self.num_heads, self.head_dim)
+
+            # --- RoPE 处理 ---
+            if not is_cross_attn:
+                if self.kv_cache_enabled:
+                    q = self.rotary(q, offset=self.cache_pos)
+                    k_new = self.rotary(k, offset=self.cache_pos)
+                    k = k_new 
+                else:
+                    q = self.rotary(q)
+                    k = self.rotary(k)
+            else:
+                q = self.rotary(q, offset=self.cache_pos if self.kv_cache_enabled else 0)
+                k_new = k  # 点云 K 保持静态结构
+
+            # --- KV Cache 更新 ---
+            if self.kv_cache_enabled:
+                if not is_cross_attn:
+                    # Self-Attention: 追加写入 Cache，并递增 cache_pos
+                    q_len = q.size(1)
+                    self.k_cache[:, self.cache_pos:self.cache_pos + q_len] = k_new
+                    self.v_cache[:, self.cache_pos:self.cache_pos + q_len] = v
+                    k = self.k_cache[:, :self.cache_pos + q_len]
+                    v = self.v_cache[:, :self.cache_pos + q_len]
+                    self.cache_pos += q_len
+                else:
+                    # Cross-Attention: 只在 cache_pos == 0 时写入完整的点云
+                    if self.cache_pos == 0:
+                        ctx_len = k.size(1)
+                        self.k_cache[:, :ctx_len] = k_new
+                        self.v_cache[:, :ctx_len] = v
+                        self.context_len = ctx_len # 新增一个属性记录点云长度
+                        
+                    k = self.k_cache[:, :self.context_len]
+                    v = self.v_cache[:, :self.context_len]
+                    self.cache_pos += tgt_len # 跟踪 Q 的长度
 
         # ==========================================
-        # KV Cache 逻辑 (保持不变)
+        # 计算注意力权重 (若需要返回)
         # ==========================================
-        if self.kv_cache_enabled:
-            if self.k_cache is not None:
-                cache_len = k.size(1)
-                self.k_cache[:, self.cache_pos:self.cache_pos + cache_len] = k_new
-                self.v_cache[:, self.cache_pos:self.cache_pos + cache_len] = v
-                
-                k = self.k_cache[:, :self.cache_pos + cache_len]
-                v = self.v_cache[:, :self.cache_pos + cache_len]
-                self.cache_pos += cache_len
-                
-                if compute_attn_scores:
-                    attn_weights = torch.matmul(q.transpose(1, 2), k.transpose(1, 2).transpose(-2, -1))
-                    attn_weights = attn_weights * self.scaling
-                    self.attention_scores = F.softmax(attn_weights, dim=-1)
+        attn_weights_out = None
+        if compute_attn_scores or return_attn:
+            # 手动计算权重以供返回
+            _attn_weights = torch.matmul(q.transpose(1, 2), k.transpose(1, 2).transpose(-2, -1)) * self.scaling
+            # 注意：此处省略了 causal mask 处理，若强制要求输出严格的 causal 分布，需补充 mask
+            attn_weights_out = F.softmax(_attn_weights, dim=-1)
 
         # ==========================================
-        # 核心逻辑 2：针对 V100 的 SDPA 与因果掩码屏蔽
+        # 核心逻辑 2：SDPA 与因果掩码
         # ==========================================
-        # 转置为 SDPA 要求的维度: [batch_size, num_heads, seq_len, head_dim]
         q_sdpa = q.transpose(1, 2)
         k_sdpa = k.transpose(1, 2)
         v_sdpa = v.transpose(1, 2)
 
-        # 【重点】：如果是交叉注意力（看点云），强制关闭 Causal Mask！
         final_causal = causal if not is_cross_attn else False
 
-        # 调用原生 SDPA
         attn_output = F.scaled_dot_product_attention(
             q_sdpa, 
             k_sdpa, 
@@ -135,11 +156,14 @@ class MultiheadFlashrope(nn.Module):
             is_causal=final_causal
         )
 
-        # 转回原维度并投影
-        attn_output = attn_output.transpose(1, 2)
-        attn_output = attn_output.contiguous().view(bsz, tgt_len, embed_dim)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, tgt_len, embed_dim)
         attn_output = self.out_proj(attn_output)
 
+        # ==========================================
+        # 修复返回值以匹配 Block 层解包
+        # ==========================================
+        if return_attn:
+            return attn_output, attn_weights_out
         return attn_output
 
     # ... 其他保持不变的函数 ...

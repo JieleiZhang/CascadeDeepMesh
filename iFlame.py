@@ -75,7 +75,7 @@ class Args:
         self.min_lr = 1.28e-6        # Minimum learning rate
         self.warmup_epochs =10    # Number of warmup epochs
         self.epochs =400      # Total number of training epochs
-        self.batch_size = 16  #40#57   # Batch size
+        self.batch_size = 12  #40#57   # Batch size
         # self.world_size = 4       # Number of dist5ributed processes (adjust if using DDP)
 
 args = Args()
@@ -293,7 +293,7 @@ def train_model(model, scheduler, optimizer, criterion, dataloader, device, scal
             
             if metric_to_track < best_val_loss:
                 best_val_loss = metric_to_track
-                best_path = "checkpoints/iFlame_best_400.pth"
+                best_path = "checkpoints/iFlame_best_400_without_hourglass_continue.pth"
                 torch.save(current_checkpoint, best_path)
                 print(f"⭐ 发现更低 Val Loss: {best_val_loss:.6f}, 已更新 best 权重。")
             
@@ -323,35 +323,27 @@ def main(rank, world_size):
 
     # 2. 模型初始化
     num_categories = 4740  
-    model = iFlame(num_categories=num_categories, embed_dim=768, num_heads=16)
+    model = Causal_iFlame(num_categories=num_categories, embed_dim=768, num_heads=16)
     model.to(device)
 
     # 3. 特征冻结逻辑 (必须在 DDP 包装和 Optimizer 定义之前！)
     if rank == 0: 
         print("🛡️ 开启两阶段训练法：阶段一（精准冻结老教授，狂练新生儿！）")
 
-    # 默认全开启
-    # for param in model.parameters():
-    #     param.requires_grad = True
-
-    # # 针对性冻结
-    # for name, param in model.named_parameters():
-    #     # 注意：在DDP包装前，name不带'module.'前缀
-    #     if 'pc_adapter.encoder' in name: 
-    #         param.requires_grad = False
-    #     if 'pc_adapter.cond_head_proj' in name or 'pc_adapter.cond_proj' in name:
-    #         param.requires_grad = True
 
     # 4. 加载预训练权重 (在 DDP 包装前加载，逻辑更清晰)
-    checkpoint_path = None # "checkpoints/iFlame_best.pth"
+    # checkpoint_path = "checkpoints/iFlame_400_epoch_260_.pth"
+    checkpoint_path = None
     startepoc = 0
+    checkpoint = None # 🌟 提前声明，方便后续加载优化器状态
 
     if checkpoint_path and os.path.exists(checkpoint_path):
-        # 针对 ARM 平台，map_location 必须明确
         checkpoint = torch.load(checkpoint_path, map_location=device)
         state_dict = checkpoint['model_state_dict']
         
-        # 自动处理权重文件可能带有的 'module.' 前缀（如果权重是 DDP 保存的）
+        # 🌟 尝试从权重文件中读取 epoch，如果没有保存则手动回退到 260
+        startepoc = checkpoint.get('epoch', 260) 
+        
         new_state_dict = {}
         for k, v in state_dict.items():
             name = k[7:] if k.startswith('module.') else k
@@ -359,7 +351,7 @@ def main(rank, world_size):
             
         try:
             model.load_state_dict(new_state_dict, strict=True)
-            if rank == 0: print(f"✅ 成功严格加载权重 '{checkpoint_path}'")
+            if rank == 0: print(f"✅ 成功严格加载权重 '{checkpoint_path}'，将从 Epoch {startepoc} 继续训练！")
         except Exception as e:
             if rank == 0: print(f"⚠️ 严格加载失败，尝试非严格加载... (Missing/Unexpected keys)")
             model.load_state_dict(new_state_dict, strict=False)
@@ -379,6 +371,7 @@ def main(rank, world_size):
     if rank == 0:
         total_params = sum(param.numel() for param in model.parameters())
         trainable_params = sum(param.numel() for param in model.parameters() if param.requires_grad)
+        print(f"🕵️ 真实实例化的 Transformer 层数: {len(model.module.layers)}")
         print(f"Total params: {total_params} | Trainable: {trainable_params}")
 
     # 6. 优化器与损失函数
@@ -432,6 +425,32 @@ def main(rank, world_size):
         lr_start=stage1_lr, 
         lr_end=1e-5
     )
+
+    # ==========================================
+    # 🌟 新增：恢复优化器、调度器和混合精度 Scaler 的状态
+    # ==========================================
+    if checkpoint is not None:
+        try:
+            # 恢复 Optimizer
+            if 'optimizer_state_dict' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                if rank == 0: print("🔌 成功恢复 Optimizer 动量与状态")
+            else:
+                if rank == 0: print("⚠️ Checkpoint 中未找到 Optimizer 状态，将重新初始化优化器 (Loss 可能会有短暂波动)。")
+
+            # 恢复 Scheduler
+            if 'scheduler_state_dict' in checkpoint:
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                if rank == 0: print("📉 成功恢复 LR Scheduler 状态")
+
+            # 恢复 Scaler (如果你之前用了 AMP)
+            if 'scaler_state_dict' in checkpoint:
+                scaler.load_state_dict(checkpoint['scaler_state_dict'])
+                if rank == 0: print("⚖️ 成功恢复 AMP Scaler 状态")
+                
+        except Exception as e:
+            if rank == 0: print(f"⚠️ 恢复训练状态时发生错误: {e}。将使用全新状态继续训练。")
+    # ==========================================
 
     # 8. 启动训练
     try:

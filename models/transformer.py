@@ -279,49 +279,54 @@ def pad_to_multiple(tensor, multiple, dim=-1, pad_value=0):
 
 class DifferentialTransformerBlockrope(nn.Module):
     def __init__(self, embed_dim, num_heads, depth, args, causal=False):
-        """
-        Differential Transformer Block with optional causal self-attention or cross-attention
-        and automatic application of ROPE.
-        
-        Args:
-            embed_dim (int): Embedding dimension.
-            num_heads (int): Number of attention heads.
-            depth (int): Depth level for lambda initialization.
-            args (Namespace): Arguments for attention settings.
-            causal (bool): Whether to use causal masking by default for self-attention.
-        """
         super(DifferentialTransformerBlockrope, self).__init__()
         
-        # Multihead differential attention module
-        self.attn = MultiheadFlashrope(args, embed_dim, depth, num_heads)
+        # 1. 自注意力模块 (Self-Attention)
+        self.self_attn = MultiheadFlashrope(args, embed_dim, depth, num_heads)
+        
+        # 2. 交叉注意力模块 (Cross-Attention)
+        self.cross_attn = MultiheadFlashrope(args, embed_dim, depth, num_heads)
+        
         self.causal = causal
         self.depth = depth
 
         self.feed_forward = SwiGLU(embed_dim)
-        self.norm1 = RMSNorm(embed_dim, eps=1e-5)
-        self.norm2 = RMSNorm(embed_dim, eps=1e-5)
-        self.norm_context = RMSNorm(embed_dim, eps=1e-5)
+        
+        # 为不同阶段准备独立的 Norm (Pre-Norm 架构必备)
+        self.norm1 = RMSNorm(embed_dim, eps=1e-5)         # Self-Attention 前
+        self.norm2 = RMSNorm(embed_dim, eps=1e-5)         # Cross-Attention 前 (主序列)
+        self.norm_context = RMSNorm(embed_dim, eps=1e-5)  # Cross-Attention 前 (点云条件)
+        self.norm3 = RMSNorm(embed_dim, eps=1e-5)         # FFN 前
     
-    def forward(self, x, context=None, use_cache=False,return_attn=False):
-        """
-        Args:
-            x: Input tensor
-            context: Optional context for cross-attention
-            use_cache: Whether to use KV cache
-        """
-        # Enable/disable KV cache in attention module
-        self.attn.kv_cache_enabled = use_cache
+    def forward(self, x, context=None, use_cache=False, return_attn=False):
+        # 缓存控制
+        self.self_attn.kv_cache_enabled = use_cache
+        self.cross_attn.kv_cache_enabled = use_cache
 
-        if context is None:
-            attn_out = self.attn(self.norm1(x), causal=self.causal,return_attn=return_attn)
-        else:
-            attn_out = self.attn(self.norm1(x), context=self.norm_context(context), causal=self.causal,return_attn=return_attn)
+        # ==========================================
+        # 阶段 1：自注意力 (Self-Attention) - 理清序列内部关系
+        # ==========================================
+        sa_out = self.self_attn(self.norm1(x), context=None, causal=self.causal, return_attn=return_attn)
+        x = x + sa_out  # 残差连接
 
-        x = x + attn_out
+        # ==========================================
+        # 阶段 2：交叉注意力 (Cross-Attention) - 对齐点云几何特征
+        # ==========================================
+        if context is not None:
+            # 注意：交叉注意力时，主序列看点云，点云是全局的，所以 causal=False！
+            ca_out = self.cross_attn(
+                self.norm2(x), 
+                context=self.norm_context(context), 
+                causal=False, 
+                return_attn=return_attn
+            )
+            x = x + ca_out  # 残差连接
 
-        # Feed-forward network with residual connection
-        ff_out = self.feed_forward(self.norm2(x))
-        x = x + ff_out
+        # ==========================================
+        # 阶段 3：前馈神经网络 (FFN) - 特征升维与非线性映射
+        # ==========================================
+        ff_out = self.feed_forward(self.norm3(x))
+        x = x + ff_out  # 残差连接
         
         return x
 
@@ -722,7 +727,7 @@ class iFlame(nn.Module):
 
 
 class Causal_iFlame(nn.Module):
-    def __init__(self, embed_dim=256, num_heads=8, depth=16, num_categories=0):
+    def __init__(self, embed_dim=256, num_heads=8, depth=12, num_categories=0):
         super(Causal_iFlame, self).__init__()
         self.embed_dim = embed_dim
         
@@ -730,10 +735,10 @@ class Causal_iFlame(nn.Module):
         self.embedding = nn.Embedding(num_categories, embed_dim) 
         self.norm = RMSNorm(embed_dim, eps=1e-5)
 
-        # 2. 接入 Michelangelo 点云适配器 (保持不变)
-        self.pc_adapter = MichelangeloAdapter(
-            weights_path="./checkpoints/michelangelo_encoder_only.pth", 
-            iflame_dim=embed_dim,
+        self.pc_adapter = PointConditioner(
+            model_name='miche-256-feature',
+            cond_dim=768,           # Miche 原始特征维度
+            out_dim=embed_dim,      # 映射到你的 iFlame 维度
             freeze=True
         )
 
@@ -746,9 +751,7 @@ class Causal_iFlame(nn.Module):
         
         self.layers = nn.ModuleList([
             DifferentialTransformerBlockrope(embed_dim, num_heads, depth=i+1, args=None, causal=True) 
-            if (i + 1) % 4 == 0 else 
-            DifferentialTransformerBlocklinearrope(embed_dim, num_heads, depth=i+1, args=None, causal=True) #删掉
-            for i in range(depth) # 默认 24 层
+            for i in range(depth) 
         ])
 
         # 3. 输出层 (保持不变)
@@ -768,9 +771,6 @@ class Causal_iFlame(nn.Module):
             if pc is not None:
                 context = self.pc_adapter(pc) # [B, 257, embed_dim]
                 
-                # 训练时的 15% 盲画逻辑
-                if self.training and torch.rand(1, device=x.device).item() < 0.15:
-                    context = torch.zeros_like(context) 
             else:
                 dummy_b = x.shape[0]
                 context = torch.zeros((dummy_b, 257, self.embed_dim), device=x.device, dtype=x.dtype)

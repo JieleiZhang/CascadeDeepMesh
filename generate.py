@@ -10,18 +10,8 @@ from models.transformer import *
 # ⚠️ 请确保这里的路径能正确导入你的 Tokenizer
 from utils.tokenizer import CascadedTokenizer 
 
-import numpy as np
-import trimesh
-import torch
-
 def load_custom_point_cloud(file_path, num_points=4096, device='cuda', expected_channels=6):
-    """
-    优化后的点云加载函数
-    num_points: 建议与训练时的点数保持一致（你之前的日志显示是 4096）
-    expected_channels: 关键参数！如果模型训练时用的是 XYZ+Normal，这里必须是 6
-    """
-    print(f"📥 正在加载外部点云: {file_path}")
-    
+    """优化后的点云加载函数"""
     # 1. 读取数据
     if file_path.endswith('.npy'):
         pc = np.load(file_path)
@@ -45,7 +35,6 @@ def load_custom_point_cloud(file_path, num_points=4096, device='cuda', expected_
                 pc = np.concatenate([pc_coords, normals], axis=-1)
 
             elif isinstance(geom, trimesh.Trimesh):
-                # 采样点数增加一点保险量
                 pc_coords, face_indices = trimesh.sample.sample_surface(geom, num_points)
                 normals = geom.face_normals[face_indices]
                 pc = np.concatenate([pc_coords, normals], axis=-1)
@@ -55,15 +44,10 @@ def load_custom_point_cloud(file_path, num_points=4096, device='cuda', expected_
             print(f"❌ 读取文件失败: {e}，改用全零占位。")
             pc = np.zeros((num_points, expected_channels))
 
-    # ==========================================
     # 🔍 关键修复 1：通道对齐
-    # ==========================================
-    # 如果模型需要 6 通道但我们只有 3 通道，补齐它
     if pc.shape[1] == 3 and expected_channels == 6:
-        print("⚠️ 模型需要 6 通道但输入只有 3 通道，正在补全零法向量...")
         dummy_normals = np.zeros_like(pc)
         pc = np.concatenate([pc, dummy_normals], axis=-1)
-    # 如果有多余通道，截断它
     elif pc.shape[1] > expected_channels:
         pc = pc[:, :expected_channels]
 
@@ -75,14 +59,10 @@ def load_custom_point_cloud(file_path, num_points=4096, device='cuda', expected_
         indices = np.random.choice(len(pc), num_points, replace=True)
         pc = pc[indices]
 
-    # ==========================================
     # 🔍 关键修复 2：严格的归一化 (保持与训练一致)
-    # ==========================================
     coords = pc[:, :3]
-    # 中心化
     center = (coords.min(axis=0) + coords.max(axis=0)) / 2.0
     coords -= center
-    # 缩放：将最大边长缩放到 1.0 (即范围约为 [-0.5, 0.5])
     scale = (coords.max(axis=0) - coords.min(axis=0)).max()
     if scale > 0:
         coords /= scale
@@ -94,36 +74,32 @@ def load_custom_point_cloud(file_path, num_points=4096, device='cuda', expected_
         norms = np.linalg.norm(pc[:, 3:], axis=1, keepdims=True)
         pc[:, 3:] = pc[:, 3:] / (norms + 1e-8)
 
-    # ==========================================
     # 🔍 关键修复 3：防止双重 unsqueeze
-    # ==========================================
     pc_tensor = torch.tensor(pc, dtype=torch.float32).to(device)
-    
-    # 确保返回的形状是 [1, num_points, channels]
     if pc_tensor.dim() == 2:
         pc_tensor = pc_tensor.unsqueeze(0)
     
-    print(f"📊 引导点云准备完毕: {pc_tensor.shape}, 范围: [{pc_tensor.min():.2f}, {pc_tensor.max():.2f}]")
     return pc_tensor
 
 def main():
+    # ==========================================
+    # 🎛️ 控制台打印开关 (设为 True 可查看详细对比与诊断信息)
+    # ==========================================
+    VERBOSE = False 
+
     # 1. 环境与基础配置
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = CascadedTokenizer()
     
-    # 路径配置
-    ckpt_path = "checkpoints/iFlame_best_1.pth"
-    my_pc_path = "data/preview_meshes/val/val_preview_021_03211117_a6ce00ec813199804e2b01a3e0fd3197_dec05.obj"
-    output_dir = "outputs"
+    ckpt_path = "checkpoints/iFlame_400_finetune_epoch_50.pth"
+    my_pc_path = "data/preview_meshes/train/train_preview_001_04379243_e94dcd39a8e438851b17743c18fb63dc_dec05.obj"
+    output_dir = "outputs_train"
     os.makedirs(output_dir, exist_ok=True)
 
     # 2. 初始化模型
-    print(f"🤖 正在初始化 iFlame 架构...")
-    # 请确保参数与训练时一致 (num_categories, embed_dim, num_heads)
-    model = Causal_iFlame(num_categories=tokenizer.vocab_size, embed_dim=512, num_heads=16)
+    print("🤖 初始化 iFlame 架构并加载权重...")
+    model = Causal_iFlame(num_categories=tokenizer.vocab_size, embed_dim=768, num_heads=16)
 
-    # 3. 加载权重 (带清洗逻辑)
-    print(f"📦 正在从 {ckpt_path} 加载权重...")
     if not os.path.exists(ckpt_path):
         print(f"❌ 错误：找不到权重文件 {ckpt_path}")
         return
@@ -131,127 +107,194 @@ def main():
     checkpoint = torch.load(ckpt_path, map_location=device)
     state_dict = checkpoint['model_state_dict']
     
-    # 自动移除 DataParallel 产生的 module. 或 _orig_mod. 前缀
-    new_state_dict = {}
-    for k, v in state_dict.items():
-        name = k.replace('module.', '').replace('_orig_mod.', '')
-        new_state_dict[name] = v
+    # 清洗 module 前缀
+    new_state_dict = {k.replace('module.', '').replace('_orig_mod.', ''): v for k, v in state_dict.items()}
     
-    model.load_state_dict(new_state_dict)
+    model.load_state_dict(new_state_dict, strict=True)
     model.to(device).eval()
-    print("✅ 权重加载成功！")
 
     # 4. 准备引导点云
     try:
-        # 使用我们之前优化过的加载函数，确保返回 [1, 4096, 6] 的 Tensor
         test_pc = load_custom_point_cloud(my_pc_path, num_points=4096, device=device, expected_channels=6)
     except Exception as e:
-        print(f"❌ 读取点云失败: {e}，将使用随机噪声。")
+        print(f"❌ 读取点云失败: {e}，使用随机噪声。")
         test_pc = torch.randn(1, 4096, 6).to(device)
 
-    # 5. 启动自回归生成
-    print("🧠 正在生成 3D 序列 (状态机强制语法约束)...")
-    # 构建初始输入: [SOS]
-    input_ids = torch.tensor([[tokenizer.SOS_TOKEN]], dtype=torch.long).to(device)
+    # 5. 准备初始输入 Token
+    prompt_obj_path = my_pc_path 
+    prompt_ratio = 0 
+    
+    def normalize_vertices(vertices):
+        bounds = np.array([vertices.min(axis=0), vertices.max(axis=0)])
+        vertices = vertices - (bounds[0] + bounds[1])[None, :] / 2
+        vertices = vertices / (bounds[1] - bounds[0]).max()
+        return vertices
 
+    full_seq = None
+    prefix_length = 0
+
+    try:
+        prompt_mesh = trimesh.load(prompt_obj_path, force='mesh', process=False)
+        prompt_mesh.vertices = normalize_vertices(prompt_mesh.vertices.copy())
+        
+        raw_tokens = tokenizer.encode_mesh(prompt_mesh)
+        split_data = tokenizer.split_tokens(raw_tokens)
+        
+        part_p, part_b, part_o = split_data['stage1'][:-1], split_data['stage2'][1:-1], split_data['stage3'][1:]
+        sep = np.array([tokenizer.SEP_TOKEN], dtype=np.int64)
+        
+        full_seq = np.concatenate([part_p, sep, part_b, sep, part_o])
+        total_len = len(full_seq)
+
+        prefix_length = max(1, min(total_len, int(total_len * prompt_ratio)))
+        initial_tokens = full_seq[:prefix_length].tolist()
+        
+        if initial_tokens[0] != tokenizer.SOS_TOKEN:
+            initial_tokens = [tokenizer.SOS_TOKEN] + initial_tokens
+            prefix_length = len(initial_tokens) 
+            
+        input_ids = torch.tensor([initial_tokens], dtype=torch.long).to(device)
+
+    except Exception as e:
+        print(f"⚠️ 提取初始 Token 失败，详细原因: {e}")
+        input_ids = torch.tensor([[tokenizer.SOS_TOKEN]], dtype=torch.long).to(device)
+
+    # 6. 自回归生成
+    print("🚀 正在生成 3D 序列...")
     with torch.no_grad():
         generated_sequence = model.generate_sequence(
             initial_input=input_ids,
             pc=test_pc,
-            max_seq_len=2816,      # 建议设为 2048 或 2304 以提速，2816 是绝对安全上限
+            max_seq_len=2816,      
             device=device,
             end_symbol=tokenizer.EOS_TOKEN,
-            temperature=0.6,       # 针对 3D 坐标建议 0.4 - 0.7 之间
-            top_k=30,              # 收紧采样范围，减少飞点
-            top_p=0.95         
-        )[0] # 取出 batch 中的第一个结果
+            temperature=0.4,       
+            top_k=15,              
+            top_p=0.9         
+        )[0]
+        
+    # ==========================================
+    # 7. 🔍 输出与原始 Token 的对比分析 (仅在 VERBOSE开启 时显示)
+    # ==========================================
+    if VERBOSE:
+        print("\n" + "="*40 + "\n 📈 Token 级生成质量对比\n" + "="*40)
+        if full_seq is not None and prefix_length > 0:
+            valid_generated = generated_sequence.cpu().numpy() if isinstance(generated_sequence, torch.Tensor) else np.array(generated_sequence)
+            valid_generated = valid_generated[valid_generated != tokenizer.PAD_TOKEN]
+            
+            generated_tail = valid_generated[prefix_length:]
+            original_tail = full_seq[prefix_length:]
+            
+            print(f"📏 真实长度: {len(original_tail)} | 续写长度: {len(generated_tail)} | 差异: {abs(len(generated_tail) - len(original_tail))}")
+            
+            min_len = min(len(generated_tail), len(original_tail))
+            if min_len > 0:
+                exact_matches = np.sum(generated_tail[:min_len] == original_tail[:min_len])
+                print(f"🎯 逐位匹配: {exact_matches}/{min_len} ({(exact_matches/min_len)*100:.2f}%)")
+                print(f"📏 L1 距离: {np.mean(np.abs(generated_tail[:min_len] - original_tail[:min_len])):.2f}")
+                print(f"👻 新颖 Token 数量: {len(set(generated_tail) - set(original_tail))}")
+        else:
+            print("⚠️ 未提取到原始序列，跳过对比。")
+        print("="*40 + "\n")
 
-    # 6. 保存原始 Token 序列 (用于备份分析)
+    # 保存原始 Token
     token_save_path = os.path.join(output_dir, "generated_tokens.npy")
     np.save(token_save_path, generated_sequence)
-    print(f"💾 原始 Token 已保存至: {token_save_path}")
 
-    # 7. 精准级联解码逻辑
-    print("🔨 正在执行精准级联解码...")
-    # 移除 Padding
+    # 8. 精准级联解码逻辑
     real_sequence = generated_sequence[generated_sequence != tokenizer.PAD_TOKEN]
 
     try:
-        # 分段逻辑：Patch -> Block -> Offset
-        sep_indices = np.where(real_sequence == tokenizer.SEP_TOKEN)[0]
-        if len(sep_indices) < 1:
-            print("❌ 错误：生成序列不完整，未找到分隔符 SEP。")
+        part_p_list, part_b_list, part_o_list = [], [], []
+        current_stage = None
+
+        for token in real_sequence:
+            token_val = int(token)
+            if token_val in [getattr(tokenizer, 'SOS_TOKEN', -1), getattr(tokenizer, 'EOS_TOKEN', -1)]:
+                continue
+
+            if token_val == tokenizer.SEP_TOKEN:
+                if current_stage == 'P': part_p_list.append(token_val)
+                elif current_stage == 'B': part_b_list.append(token_val)
+                elif current_stage == 'O': part_o_list.append(token_val)
+                continue
+
+            if (tokenizer.PATCH_BASE <= token_val < tokenizer.BLOCK_BASE) or \
+               (tokenizer.SPECIAL_PATCH_BASE <= token_val < tokenizer.VOCAB_END):
+                part_p_list.append(token_val)
+                current_stage = 'P'
+            elif tokenizer.BLOCK_BASE <= token_val < tokenizer.OFFSET_BASE:
+                part_b_list.append(token_val)
+                current_stage = 'B'
+            elif tokenizer.OFFSET_BASE <= token_val < tokenizer.SPECIAL_PATCH_BASE:
+                part_o_list.append(token_val)
+                current_stage = 'O'
+
+        part_p = np.array(part_p_list, dtype=real_sequence.dtype)
+        part_b = np.array(part_b_list, dtype=real_sequence.dtype)
+        part_o = np.array(part_o_list, dtype=real_sequence.dtype)
+
+        if len(part_p) == 0: print("⚠️ 警告：未找到有效的 Patch 数据。")
+        if len(part_b) == 0: 
+            print("❌ 错误：未找到有效的 Block 数据。")
             return
 
-        # 切分 Patch 部分
-        bridge1_idx = sep_indices[0]
-        part_p = real_sequence[1:bridge1_idx] 
-        
-        # 在剩余部分找 Block
-        rest = real_sequence[bridge1_idx + 1 :]
-        block_mask = (rest >= tokenizer.BLOCK_BASE) & (rest < tokenizer.OFFSET_BASE)
-        block_indices = np.where(block_mask)[0]
-        
-        if len(block_indices) == 0:
-            print("❌ 错误：序列中未找到有效的 Block 数据。")
-            return
+        # 解码
+        mesh_recon, recon_tokens = tokenizer.decode_mesh(part_p, part_b, part_o)
+        recon_tokens = np.array(recon_tokens)
+
+        # ==========================================
+        # 🔍 Token 类别分布与越界诊断 (仅在 VERBOSE开启 时显示)
+        # ==========================================
+        if VERBOSE:
+            print("\n" + "="*50 + "\n 🧮 Token 类别分布诊断 \n" + "="*50)
+            raw_np, gen_np = np.array(raw_tokens), recon_tokens 
+
+            def categorize_tokens(tokens):
+                return {
+                    "Patch (宏观)": np.sum((tokens >= 0) & (tokens < tokenizer.BLOCK_BASE)),
+                    "Block (中观)": np.sum((tokens >= tokenizer.BLOCK_BASE) & (tokens < tokenizer.OFFSET_BASE)),
+                    "Offset (细节)": np.sum((tokens >= tokenizer.OFFSET_BASE) & (tokens < tokenizer.SOS_TOKEN)),
+                    "[SEP] (分隔符)": np.sum(tokens == tokenizer.SEP_TOKEN),
+                }
+
+            raw_counts, gen_counts = categorize_tokens(raw_np), categorize_tokens(gen_np)
             
-        last_block_idx = block_indices[-1]
-        part_b = rest[:last_block_idx + 1]
-        part_o = rest[last_block_idx + 1:] # 剩下的即为 Offset 区
+            print(f"{'类别':<15} | {'GT':<8} | {'Gen':<8} | {'Diff'}")
+            print("-" * 45)
+            for cat in raw_counts.keys():
+                diff = gen_counts[cat] - raw_counts[cat]
+                flag = "⚠️" if diff != 0 else "✅"
+                print(f"{cat:<15} | {raw_counts[cat]:<8} | {gen_counts[cat]:<8} | {diff:<4} {flag}")
 
-        print(f"✂️ 序列切分成功 -> Patch: {len(part_p)}, Block: {len(part_b)}, Offset: {len(part_o)}")
+            max_valid_id = max(tokenizer.SOS_TOKEN, tokenizer.EOS_TOKEN, tokenizer.SEP_TOKEN, tokenizer.PAD_TOKEN)
+            if np.sum(gen_np > max_valid_id) > 0:
+                print(f"\n🚨 警告: 包含 {np.sum(gen_np > max_valid_id)} 个非法越界 Token！")
+            print("="*50 + "\n")
 
-        # 构造 tokenizer.decode_mesh 期望的输入格式
-        def wrap_tokens(tokens):
-            return np.concatenate([[tokenizer.SOS_TOKEN], tokens, [tokenizer.EOS_TOKEN]])
-
-        p_seq = wrap_tokens(part_p)
-        b_seq = wrap_tokens(part_b)
-        o_seq = wrap_tokens(part_o)
-
-        # 解码为 trimesh 对象
-        mesh_recon, _ = tokenizer.decode_mesh(p_seq, b_seq, o_seq)
-
-        # 8. 安全保存结果 (防止 WebDAV 异常)
-        # 自动生成不重复的文件名
+        # 9. 保存结果
         base_name = "generated_iflame_result"
         idx = 1
-        while os.path.exists(os.path.join(output_dir, f"{base_name}_{idx}.obj")):
-            idx += 1
+        while os.path.exists(os.path.join(output_dir, f"{base_name}_{idx}.obj")): idx += 1
         
-        final_mesh_name = f"{base_name}_{idx}.obj"
-        final_pc_name = f"{base_name}_{idx}_input_pc.ply"
-        
-        mesh_path = os.path.join(output_dir, final_mesh_name)
-        pc_path = os.path.join(output_dir, final_pc_name)
+        mesh_path, pc_path = os.path.join(output_dir, f"{base_name}_{idx}.obj"), os.path.join(output_dir, f"{base_name}_{idx}_input_pc.ply")
 
-        # --- A. 保存生成的 Mesh ---
         if isinstance(mesh_recon, trimesh.Trimesh):
             mesh_recon.export(mesh_path)
         else:
-            # 备选：手动构造 mesh
-            faces = np.arange(len(mesh_recon)).reshape(-1, 3)
-            trimesh.Trimesh(vertices=mesh_recon, faces=faces).export(mesh_path)
+            trimesh.Trimesh(vertices=mesh_recon, faces=np.arange(len(mesh_recon)).reshape(-1, 3)).export(mesh_path)
         
-        # --- B. 安全保存引导点云 (修复 CUDA 报错) ---
-        # 关键：先 .cpu().numpy()
+        # 安全保存点云
         pc_np = test_pc.squeeze(0).detach().cpu().numpy()
-        # 创建本地临时文件作为中转
         with tempfile.NamedTemporaryFile(suffix=".ply", delete=False) as tmp:
-            tmp_path = tmp.name
-        
-        try:
-            trimesh.PointCloud(pc_np[:, :3]).export(tmp_path)
-            shutil.copy2(tmp_path, pc_path) # 稳定写入目标目录
-            print(f"✅ 引导点云已保存: {pc_path}")
-        finally:
-            if os.path.exists(tmp_path): os.remove(tmp_path)
+            trimesh.PointCloud(pc_np[:, :3]).export(tmp.name)
+            shutil.copy2(tmp.name, pc_path) 
+            os.remove(tmp.name)
 
-        print(f"🎉 任务完美完成！3D 模型见: {mesh_path}")
+        print(f"🎉 任务完成！重构 Token: {len(recon_tokens)}。3D 模型见: {mesh_path}")
 
     except Exception as e:
-        print(f"❌ 解码或保存阶段发生崩溃: {e}")
+        print(f"❌ 解码阶段发生崩溃: {e}")
         import traceback
         traceback.print_exc()
 
